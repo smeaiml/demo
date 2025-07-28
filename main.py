@@ -1,46 +1,113 @@
-
-from langchain.llms import Ollama
+import os
+import json
+import time
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import FAISS
 from langchain.schema import Document
 from langchain.llms import Ollama
-from langchain.chains import RetrievalQA
-import json
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import re
 
-# Load your JSON
-with open("indiankanoon.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+# === CONFIG ===
+INDEX_DIR = "faiss_indexes"
+os.makedirs(INDEX_DIR, exist_ok=True)
 
-# Prepare documents
-documents = []
-for entry in data:
-    content = entry.get("content", "").strip()
-    if content:
-        metadata = {"title": entry["title"], "url": entry["url"]}
-        documents.append(Document(page_content=content, metadata=metadata))
+# === Input ===
+json_file_paths = [
+    "indiankanoon.json",
+    "itat.json",
+    "taxmann_output_fixed.json"
+]
+query = "What does the website tell about Article 19 (1) ?."
 
-# Embeddings
-embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-db = FAISS.from_documents(documents, embedding_model)
-db.save_local("faiss_index")
+# === Init models ===
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/paraphrase-MiniLM-L3-v2",
+    model_kwargs={"device": "cpu"}
+)
+llm = Ollama(model="phi3:mini")
 
-# Mistral via Ollama
-llm = Ollama(model="mistral")
+# === Process ===
+all_answers = []
+meta_data = []
 
-# RetrievalQA Chain
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=db.as_retriever(search_kwargs={"k": 3}),
-    return_source_documents=True
+for file_path in json_file_paths:
+    try:
+        filename = os.path.basename(file_path).replace(".json", "")
+        index_path = os.path.join(INDEX_DIR, filename)
+
+        if os.path.exists(index_path):
+            db = FAISS.load_local(index_path, embedding_model, allow_dangerous_deserialization=True)
+        else:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            documents = []
+            for entry in data:
+                content = entry.get("content", "").strip()
+                if content:
+                    metadata = {
+                        "title": entry.get("title", filename),
+                        "url": entry.get("url", "")
+                    }
+                    documents.append(Document(page_content=content, metadata=metadata))
+
+            splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40)
+            split_docs = splitter.split_documents(documents)
+            db = FAISS.from_documents(split_docs, embedding_model)
+            db.save_local(index_path)
+
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": 4})
+        docs = retriever.get_relevant_documents(query)
+        context = "\n\n".join([doc.page_content for doc in docs])
+
+        prompt = (
+            "You are an AI trained helpful assisstant to extract and summarize legal and tax document data. Use only the context below.\n"
+            "If multiple relevant pieces of text are found, summarize them in bullet points.\n"
+            "If context is ambiguous or insufficient, state clearly: 'The answer is not available in the given context.'\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question:\n{query}\n\n"
+            "Answer (prefer bullet points or numbered list if multiple clauses apply):"
+        )
+
+        start_time = time.time()
+        response = llm.invoke(prompt)
+        elapsed = time.time() - start_time
+
+        # Metadata from docs
+        for doc in docs:
+            meta_data.append({
+                "filename": doc.metadata.get("title", filename),
+                "page_num": doc.metadata.get("page", 0),
+                "url": doc.metadata.get("url", "")
+            })
+
+        all_answers.append(response.strip())
+
+    except Exception as e:
+        print(f"Skipped {file_path}: {str(e)}")
+
+# === Final Summary ===
+summary_prompt = (
+    "You are a legal assistant AI. Given multiple answers from different legal and tax documents, "
+    "summarize the combined insights clearly and concisely in bullet points only. Avoid repetition. "
+    "If some documents don’t address the question, mention that in a bullet too.\n\n"
+    + "\n\n".join(all_answers)
 )
 
-# Ask question
-question = "What is the mission of the website?"
-result = qa_chain(question)
+final_response = llm.invoke(summary_prompt).strip()
 
-print("\nQ:", question)
-print("\nAnswer:", result['result'])
+# === Extract bold/important phrases ===
+bold_words = list(set(re.findall(r"\*\*(.*?)\*\*", final_response)))
 
-# Optional: print sources
-for doc in result['source_documents']:
-    print("Source:", doc.metadata['title'], "|", doc.metadata['url'])
+# === Output Format ===
+output = {
+    "bold_words": bold_words,
+    "meta_data": meta_data,
+    "response": final_response,
+    "table_data": [],
+    "ucid": "99_18"
+}
+
+# === Print Final Output ===
+print(json.dumps(output, indent=4))
